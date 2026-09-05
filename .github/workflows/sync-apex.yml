@@ -1,0 +1,525 @@
+name: Sync Upstream + Restore APEX
+
+on:
+  workflow_dispatch:
+
+  schedule:
+    # 每 6 小时检查一次官方 Release
+    - cron: "17 */6 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream-apex
+  cancel-in-progress: false
+
+
+jobs:
+  build-release:
+    name: Sync, Build and Release
+    runs-on: ubuntu-latest
+
+    timeout-minutes: 60
+
+    steps:
+      # ------------------------------------------------------------
+      # 控制仓库
+      # ------------------------------------------------------------
+
+      - name: Checkout control repository
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+
+
+      # ------------------------------------------------------------
+      # 检查上游最新 Release
+      # ------------------------------------------------------------
+
+      - name: Detect latest upstream release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          UPSTREAM_REPO="Hybrid-Mount/meta-hybrid_mount"
+
+          UPSTREAM_TAG="$(
+            gh api \
+              "repos/${UPSTREAM_REPO}/releases?per_page=20" \
+              --jq 'map(select(.draft == false))[0].tag_name'
+          )"
+
+          if [ -z "$UPSTREAM_TAG" ] ||
+             [ "$UPSTREAM_TAG" = "null" ]; then
+
+            echo "Unable to determine upstream release" >&2
+            exit 1
+          fi
+
+          BASE_VERSION="${UPSTREAM_TAG#v}"
+
+          if [[ ! "$BASE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Invalid upstream tag: $UPSTREAM_TAG" >&2
+            exit 1
+          fi
+
+          CUSTOM_VERSION="${BASE_VERSION}-apex"
+          CUSTOM_TAG="v${CUSTOM_VERSION}"
+
+          echo "upstream_tag=$UPSTREAM_TAG" \
+            >> "$GITHUB_OUTPUT"
+
+          echo "base_version=$BASE_VERSION" \
+            >> "$GITHUB_OUTPUT"
+
+          echo "custom_version=$CUSTOM_VERSION" \
+            >> "$GITHUB_OUTPUT"
+
+          echo "custom_tag=$CUSTOM_TAG" \
+            >> "$GITHUB_OUTPUT"
+
+          echo "Upstream release: $UPSTREAM_TAG"
+          echo "Custom release:   $CUSTOM_TAG"
+
+
+      # ------------------------------------------------------------
+      # 已经发布就直接结束
+      # ------------------------------------------------------------
+
+      - name: Check existing custom release
+        id: existing
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CUSTOM_TAG: ${{ steps.release.outputs.custom_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if gh release view \
+              "$CUSTOM_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              >/dev/null 2>&1; then
+
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+
+            echo \
+              "Release $CUSTOM_TAG already exists; nothing to do."
+
+          else
+
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+
+          fi
+
+
+      # ------------------------------------------------------------
+      # Node / pnpm
+      # ------------------------------------------------------------
+
+      - name: Install Node.js
+        if: steps.existing.outputs.exists != 'true'
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+
+
+      - name: Install pnpm
+        if: steps.existing.outputs.exists != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          npm install --global pnpm@11.22.0
+
+          node --version
+          pnpm --version
+
+
+      # ------------------------------------------------------------
+      # Rust
+      # ------------------------------------------------------------
+
+      - name: Install Rust toolchains
+        if: steps.existing.outputs.exists != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rustup toolchain install stable \
+            --profile minimal
+
+          rustup default stable
+
+          rustup toolchain install nightly \
+            --profile minimal
+
+          rustc --version
+          cargo --version
+          rustc +nightly --version
+
+
+      - name: Install cargo-ndk
+        if: steps.existing.outputs.exists != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cargo install cargo-ndk --locked
+
+          cargo ndk --version
+
+
+      # ------------------------------------------------------------
+      # Android SDK / NDK
+      # ------------------------------------------------------------
+
+      - name: Setup Android SDK
+        if: steps.existing.outputs.exists != 'true'
+        uses: android-actions/setup-android@v3
+
+
+      - name: Install Android NDK
+        if: steps.existing.outputs.exists != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          NDK_VERSION="28.2.13676358"
+
+          sdkmanager "ndk;${NDK_VERSION}"
+
+          SDK_ROOT="${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
+          NDK_PATH="${SDK_ROOT}/ndk/${NDK_VERSION}"
+
+          test -d "$NDK_PATH"
+
+          echo \
+            "ANDROID_NDK_HOME=$NDK_PATH" \
+            >> "$GITHUB_ENV"
+
+          echo \
+            "ANDROID_NDK_ROOT=$NDK_PATH" \
+            >> "$GITHUB_ENV"
+
+          echo \
+            "NDK_HOME=$NDK_PATH" \
+            >> "$GITHUB_ENV"
+
+          echo "Android NDK: $NDK_PATH"
+
+
+      # ------------------------------------------------------------
+      # Rust cache
+      # ------------------------------------------------------------
+
+      - name: Cache Rust dependencies
+        if: steps.existing.outputs.exists != 'true'
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-all-crates: true
+          cache-on-failure: true
+
+
+      # ------------------------------------------------------------
+      # Clone 官方 tag
+      # ------------------------------------------------------------
+
+      - name: Clone upstream release
+        if: steps.existing.outputs.exists != 'true'
+        env:
+          UPSTREAM_TAG: ${{ steps.release.outputs.upstream_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          WORKDIR="$RUNNER_TEMP/hybrid-mount-upstream"
+
+          rm -rf "$WORKDIR"
+
+          git clone \
+            --branch "$UPSTREAM_TAG" \
+            --depth 1 \
+            "https://github.com/Hybrid-Mount/meta-hybrid_mount.git" \
+            "$WORKDIR"
+
+          echo "UPSTREAM_WORKDIR=$WORKDIR" \
+            >> "$GITHUB_ENV"
+
+
+      # ------------------------------------------------------------
+      # 恢复 /apex
+      # ------------------------------------------------------------
+
+      - name: Restore APEX support
+        if: steps.existing.outputs.exists != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cp \
+            "$GITHUB_WORKSPACE/scripts/keep-apex.py" \
+            "$UPSTREAM_WORKDIR/keep-apex.py"
+
+          cd "$UPSTREAM_WORKDIR"
+
+          GITHUB_REPOSITORY="$GITHUB_REPOSITORY" \
+            python3 keep-apex.py
+
+          rm keep-apex.py
+
+
+      # ------------------------------------------------------------
+      # 设置自定义版本
+      #
+      # 官方 v6.1.4 tag 中 Cargo.toml 有可能仍是 6.1.3，
+      # 所以版本必须以 Release tag 为唯一真值。
+      # ------------------------------------------------------------
+
+      - name: Apply custom release version
+        if: steps.existing.outputs.exists != 'true'
+        env:
+          CUSTOM_VERSION: ${{ steps.release.outputs.custom_version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd "$UPSTREAM_WORKDIR"
+
+          sed -i \
+            "s/^version = \".*\"/version = \"$CUSTOM_VERSION\"/" \
+            Cargo.toml
+
+          grep -q \
+            "^version = \"$CUSTOM_VERSION\"$" \
+            Cargo.toml
+
+          echo "Building package version $CUSTOM_VERSION"
+
+
+      # ------------------------------------------------------------
+      # Build
+      # ------------------------------------------------------------
+
+      - name: Build package
+        if: steps.existing.outputs.exists != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd "$UPSTREAM_WORKDIR"
+
+          rm -rf output
+
+          cargo xtask build --ci
+
+          ZIP_PATH="$(
+            find output \
+              -maxdepth 1 \
+              -type f \
+              -name '*.zip' \
+              | sort \
+              | head -n 1
+          )"
+
+          test -n "$ZIP_PATH"
+          test -f "$ZIP_PATH"
+
+          ZIP_PATH="$(
+            realpath "$ZIP_PATH"
+          )"
+
+          ZIP_NAME="$(
+            basename "$ZIP_PATH"
+          )"
+
+          echo "ZIP_PATH=$ZIP_PATH" \
+            >> "$GITHUB_ENV"
+
+          echo "ZIP_NAME=$ZIP_NAME" \
+            >> "$GITHUB_ENV"
+
+          echo "Built package:"
+          echo "$ZIP_PATH"
+
+
+      # ------------------------------------------------------------
+      # 发布 Release
+      # ------------------------------------------------------------
+
+      - name: Publish GitHub Release
+        if: steps.existing.outputs.exists != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+          CUSTOM_TAG: ${{ steps.release.outputs.custom_tag }}
+
+          UPSTREAM_TAG: ${{ steps.release.outputs.upstream_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          gh release create \
+            "$CUSTOM_TAG" \
+            "$ZIP_PATH" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target main \
+            --title "Hybrid Mount $CUSTOM_TAG" \
+            --notes \
+            "Based on upstream ${UPSTREAM_TAG}. Restores Hybrid Mount management of /apex."
+
+
+      # ------------------------------------------------------------
+      # 生成 update.json
+      # ------------------------------------------------------------
+
+      - name: Generate update.json
+        if: steps.existing.outputs.exists != 'true'
+        env:
+          CUSTOM_VERSION: ${{ steps.release.outputs.custom_version }}
+
+          CUSTOM_TAG: ${{ steps.release.outputs.custom_tag }}
+
+          BASE_VERSION: ${{ steps.release.outputs.base_version }}
+
+          UPSTREAM_TAG: ${{ steps.release.outputs.upstream_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          VERSION_CODE="$(
+            BASE_VERSION="$BASE_VERSION" \
+            python3 - <<'PY'
+          import os
+          import re
+
+          version = os.environ["BASE_VERSION"]
+
+          match = re.match(
+              r"^(\d+)\.(\d+)\.(\d+)",
+              version,
+          )
+
+          if not match:
+              raise SystemExit(
+                  "Invalid version: " + version
+              )
+
+          major, minor, patch = map(
+              int,
+              match.groups(),
+          )
+
+          print(
+              major * 100000
+              + minor * 1000
+              + patch
+          )
+          PY
+          )"
+
+          CUSTOM_VERSION="$CUSTOM_VERSION" \
+          CUSTOM_TAG="$CUSTOM_TAG" \
+          UPSTREAM_TAG="$UPSTREAM_TAG" \
+          VERSION_CODE="$VERSION_CODE" \
+          ZIP_NAME="$ZIP_NAME" \
+          GITHUB_REPOSITORY="$GITHUB_REPOSITORY" \
+          python3 - <<'PY'
+          import json
+          import os
+
+          repo = os.environ[
+              "GITHUB_REPOSITORY"
+          ]
+
+          custom_version = os.environ[
+              "CUSTOM_VERSION"
+          ]
+
+          custom_tag = os.environ[
+              "CUSTOM_TAG"
+          ]
+
+          upstream_tag = os.environ[
+              "UPSTREAM_TAG"
+          ]
+
+          zip_name = os.environ[
+              "ZIP_NAME"
+          ]
+
+          version_code = int(
+              os.environ["VERSION_CODE"]
+          )
+
+          payload = {
+              "version": custom_version,
+
+              "versionCode": version_code,
+
+              "zipUrl": (
+                  f"https://github.com/{repo}/"
+                  f"releases/download/"
+                  f"{custom_tag}/"
+                  f"{zip_name}"
+              ),
+
+              "changelog": (
+                  "https://github.com/"
+                  "Hybrid-Mount/"
+                  "meta-hybrid_mount/"
+                  f"releases/tag/"
+                  f"{upstream_tag}"
+              ),
+          }
+
+          with open(
+              "update.json",
+              "w",
+              encoding="utf-8",
+          ) as f:
+
+              json.dump(
+                  payload,
+                  f,
+                  indent=2,
+                  ensure_ascii=False,
+              )
+
+              f.write("\n")
+          PY
+
+
+      # ------------------------------------------------------------
+      # 保存 update.json 到 main
+      # ------------------------------------------------------------
+
+      - name: Commit update.json
+        if: steps.existing.outputs.exists != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config \
+            user.name \
+            "github-actions[bot]"
+
+          git config \
+            user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add update.json
+
+          if git diff --cached --quiet; then
+            echo "update.json unchanged"
+            exit 0
+          fi
+
+          git commit \
+            -m "chore: update APEX release metadata"
+
+          git push origin main
