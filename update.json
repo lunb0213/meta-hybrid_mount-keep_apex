@@ -1,6 +1,6 @@
 {
-  "version": "6.1.4-apex",
-  "versionCode": 601004,
-  "zipUrl": "https://github.com/lunb0213/meta-hybrid_mount-keep_apex/releases/download/v6.1.4-apex/Hybrid-Mount-6.1.4-apex-1.zip",
-  "changelog": "https://github.com/Hybrid-Mount/meta-hybrid_mount/releases/tag/v6.1.4"
+  "version": "6.2.0-apex",
+  "versionCode": 602000,
+  "zipUrl": "https://github.com/lunb0213/meta-hybrid_mount-keep_apex/releases/download/v6.2.0-apex/Hybrid-Mount-6.2.0-apex-1.zip",
+  "changelog": "https://github.com/Hybrid-Mount/meta-hybrid_mount/releases/tag/v6.2.0"
 }
