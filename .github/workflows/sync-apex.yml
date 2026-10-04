@@ -180,7 +180,7 @@ jobs:
 
       - name: Setup Android SDK
         if: steps.existing.outputs.exists != 'true'
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@v4
 
 
       - name: Install Android NDK
